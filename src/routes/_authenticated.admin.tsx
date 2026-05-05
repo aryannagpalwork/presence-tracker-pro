@@ -108,7 +108,7 @@ function AdminPage() {
 
       <div className="h-[70vh] overflow-hidden rounded-lg border">
         <APIProvider apiKey={mapsKey}>
-          <Map mapId="admin" defaultCenter={center} defaultZoom={rows.length ? 5 : 2} gestureHandling="greedy">
+          <GMap mapId="admin" defaultCenter={center} defaultZoom={rows.length ? 5 : 2} gestureHandling="greedy">
             {rows.map((r) => (
               <AdvancedMarker
                 key={r.user_id}
@@ -128,7 +128,7 @@ function AdminPage() {
                 </div>
               </InfoWindow>
             )}
-          </Map>
+          </GMap>
         </APIProvider>
       </div>
     </div>

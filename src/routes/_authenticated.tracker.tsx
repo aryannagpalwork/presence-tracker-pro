@@ -104,7 +104,7 @@ function TrackerPage() {
       </div>
       <div className="h-[70vh] overflow-hidden rounded-lg border">
         <APIProvider apiKey={mapsKey}>
-          <Map
+          <GMap
             mapId="tracker"
             defaultCenter={lastPos ?? { lat: 37.7749, lng: -122.4194 }}
             center={lastPos ? { lat: lastPos.lat, lng: lastPos.lng } : undefined}
@@ -117,7 +117,7 @@ function TrackerPage() {
                 <Pin background="hsl(var(--primary))" borderColor="white" glyphColor="white" />
               </AdvancedMarker>
             )}
-          </Map>
+          </GMap>
         </APIProvider>
       </div>
     </div>
