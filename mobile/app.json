@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "Presence Tracker",
+    "slug": "presence-tracker-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "platforms": ["ios", "android"],
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSLocationUsageDescription": "Presence Tracker uses your location while sharing is enabled.",
+        "NSLocationAlwaysUsageDescription": "Presence Tracker can keep sharing your location when the app is minimized.",
+        "NSLocationWhenInUseUsageDescription": "Presence Tracker uses your location while sharing is enabled.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Presence Tracker can keep sharing your location when the app is minimized.",
+        "UIBackgroundModes": ["location"]
+      }
+    },
+    "android": {
+      "versionCode": 1,
+      "permissions": [
+        "ACCESS_NETWORK_STATE",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION"
+      ],
+      "package": "com.anonymous.presencetrackermobile"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow Presence Tracker to share your location while the app is minimized.",
+          "locationWhenInUsePermission": "Allow Presence Tracker to use your location while sharing is enabled.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isIosBackgroundLocationEnabled": true
+        }
+      ]
+    ]
+  }
+}

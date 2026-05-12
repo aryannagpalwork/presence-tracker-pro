@@ -11,13 +11,18 @@ export const Route = createFileRoute("/_authenticated")({
 function AuthenticatedLayout() {
   const { user, loading, isAdmin, signOut } = useAuth();
   const navigate = useNavigate();
+  const showAdmin = isAdmin || import.meta.env.DEV;
 
   useEffect(() => {
     if (!loading && !user) navigate({ to: "/login" });
   }, [loading, user, navigate]);
 
   if (loading || !user) {
-    return <div className="flex min-h-screen items-center justify-center text-muted-foreground">Loading…</div>;
+    return (
+      <div className="flex min-h-screen items-center justify-center text-muted-foreground">
+        Loading…
+      </div>
+    );
   }
 
   return (
@@ -28,9 +33,23 @@ function AuthenticatedLayout() {
             <MapPin className="h-5 w-5 text-primary" /> GeoTrack
           </Link>
           <nav className="flex items-center gap-2">
-            <Link to="/tracker"><Button variant="ghost" size="sm">Tracker</Button></Link>
-            {isAdmin && <Link to="/admin"><Button variant="ghost" size="sm">Admin</Button></Link>}
-            <Button variant="outline" size="sm" onClick={() => signOut().then(() => navigate({ to: "/" }))}>
+            <Link to="/tracker">
+              <Button variant="ghost" size="sm">
+                Tracker
+              </Button>
+            </Link>
+            {showAdmin && (
+              <Link to="/admin">
+                <Button variant="ghost" size="sm">
+                  Admin Panel
+                </Button>
+              </Link>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => signOut().then(() => navigate({ to: "/" }))}
+            >
               <LogOut className="mr-1 h-4 w-4" /> Sign out
             </Button>
           </nav>
