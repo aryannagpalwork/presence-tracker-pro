@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import { APIProvider, Map as GMap, AdvancedMarker, Pin, useMap } from "@vis.gl/react-google-maps";
-import { supabase } from "@/integrations/supabase/client";
+import { createClient } from "@supabase/supabase-js";
 import { useAuth } from "@/hooks/use-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -16,7 +16,6 @@ export const Route = createFileRoute("/_authenticated/tracker")({
 });
 
 const SEND_INTERVAL_MS = 7_500;
-const MIN_DISTANCE_METERS = 10;
 
 type LocationPoint = {
   lat: number;
@@ -77,6 +76,7 @@ function TrackerPage() {
   const [updatesSent, setUpdatesSent] = useState(0);
   const [statusText, setStatusText] = useState("Waiting to start");
   const watchRef = useRef<number | null>(null);
+  const pollRef = useRef<number | null>(null);
   const lastSentRef = useRef<LocationPoint | null>(null);
   const lastSentAtRef = useRef(0);
   const pendingRef = useRef<LocationPoint | null>(null);
@@ -87,6 +87,7 @@ function TrackerPage() {
     async (point: LocationPoint) => {
       if (!user) return;
 
+      console.log("Sending coordinates:", point.lat, point.lng);
       const { error } = await supabase.from("locations").insert({
         user_id: user.id,
         latitude: point.lat,
@@ -120,17 +121,15 @@ function TrackerPage() {
     setPath((currentPath) => [...currentPath, point]);
 
     const lastSent = lastSentRef.current;
-    const movedEnough = !lastSent || distanceMeters(lastSent, point) > MIN_DISTANCE_METERS;
+    const movedMeters = lastSent ? distanceMeters(lastSent, point) : Infinity;
     const intervalElapsed = Date.now() - lastSentAtRef.current >= SEND_INTERVAL_MS;
 
-    if (movedEnough && intervalElapsed) {
+    if (intervalElapsed) {
       pendingRef.current = null;
       void sendLocation(point);
-    } else if (movedEnough) {
-      pendingRef.current = point;
-      setStatusText("Movement captured, waiting to send");
     } else {
-      setStatusText("Live, movement below 10 meters");
+      pendingRef.current = point;
+      setStatusText(`Fresh GPS fix captured, waiting to send (${Math.round(movedMeters)} m)`);
     }
   }
 
@@ -157,6 +156,13 @@ function TrackerPage() {
       },
       { enableHighAccuracy: true, maximumAge: 0, timeout: 10_000 },
     );
+    pollRef.current = window.setInterval(() => {
+      navigator.geolocation.getCurrentPosition(
+        handlePosition,
+        (error) => setStatusText(locationErrorMessage(error)),
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 10_000 },
+      );
+    }, SEND_INTERVAL_MS);
 
     toast.success("Location sharing started");
   }
@@ -165,6 +171,10 @@ function TrackerPage() {
     if (watchRef.current !== null && "geolocation" in navigator) {
       navigator.geolocation.clearWatch(watchRef.current);
       watchRef.current = null;
+    }
+    if (pollRef.current !== null) {
+      window.clearInterval(pollRef.current);
+      pollRef.current = null;
     }
     pendingRef.current = null;
     setSharing(false);
@@ -235,8 +245,8 @@ function TrackerPage() {
             <div className="flex items-start gap-2 text-xs text-muted-foreground">
               <Radio className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>
-                {statusText}. Updates are sent every 5-10 seconds only after movement over 10
-                meters.
+                {statusText}. Updates are sent every 5-10 seconds with cached browser fixes
+                disabled.
               </span>
             </div>
           </CardContent>
@@ -260,6 +270,108 @@ function TrackerPage() {
             )}
           </GMap>
         </APIProvider>
+      </div>
+    </div>
+  );
+}
+
+export default function TestAdmin() {
+  const [locations, setLocations] = useState<any[]>([]);
+  const [profiles, setProfiles] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>("");
+
+  useEffect(() => {
+    const testConnection = async () => {
+      try {
+        const supabaseUrl = "https://iffrbkvgciimssrxfukt.supabase.co";
+        const supabaseAnonKey =
+          "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmZnJia3ZnY2lpbXNzcnhmdWt0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5NTg2NjEsImV4cCI6MjA5MzUzNDY2MX0.j9HnvxHLPBL1JeG6l0Xw-Qsq5IriACXQtG34T83OwVc";
+
+        const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+        // Fetch all locations
+        const { data: locationsData, error: locError } = await supabase
+          .from("locations")
+          .select("*")
+          .order("created_at", { ascending: false });
+
+        if (locError) throw locError;
+
+        // Fetch all profiles
+        const { data: profilesData, error: profError } = await supabase
+          .from("profiles")
+          .select("*");
+
+        if (profError) throw profError;
+
+        setLocations(locationsData || []);
+        setProfiles(profilesData || []);
+        setLoading(false);
+      } catch (err: any) {
+        setError(err.message);
+        setLoading(false);
+      }
+    };
+
+    testConnection();
+  }, []);
+
+  if (loading) return <div className="p-6">Loading...</div>;
+
+  return (
+    <div className="p-6 bg-gray-50 min-h-screen">
+      <h1 className="text-3xl font-bold mb-6">📍 Supabase Location Test</h1>
+
+      {error && (
+        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-6">
+          Error: {error}
+        </div>
+      )}
+
+      {/* Status */}
+      <div className="bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded mb-6">
+        <p>✅ Connected to Supabase</p>
+        <p>📊 Total Users: {profiles.length}</p>
+        <p>📍 Total Locations Tracked: {locations.length}</p>
+      </div>
+
+      {/* Users */}
+      <div className="mb-8">
+        <h2 className="text-2xl font-bold mb-4">👥 Users (Profiles)</h2>
+        {profiles.length === 0 ? (
+          <p className="text-gray-600">No users found</p>
+        ) : (
+          <div className="grid gap-4">
+            {profiles.map((profile) => (
+              <div key={profile.id} className="bg-white p-4 rounded border">
+                <p className="font-bold">{profile.id}</p>
+                <p className="text-sm text-gray-600">{profile.email}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Locations */}
+      <div>
+        <h2 className="text-2xl font-bold mb-4">📍 Recent Locations</h2>
+        {locations.length === 0 ? (
+          <p className="text-gray-600">No locations tracked yet</p>
+        ) : (
+          <div className="grid gap-4">
+            {locations.slice(0, 10).map((loc) => (
+              <div key={loc.id} className="bg-white p-4 rounded border">
+                <p className="font-bold">User: {loc.user_id}</p>
+                <p>Lat: {loc.latitude}</p>
+                <p>Lon: {loc.longitude}</p>
+                <p className="text-sm text-gray-600">
+                  {new Date(loc.created_at).toLocaleString()}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

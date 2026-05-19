@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   APIProvider,
   Map as GMap,
@@ -8,21 +8,28 @@ import {
   Pin,
   useMap,
 } from "@vis.gl/react-google-maps";
+import { formatDistanceToNow } from "date-fns";
+import { RefreshCw, Search, ShieldCheck, Users } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { formatDistanceToNow } from "date-fns";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { getMapsKey } from "@/lib/maps-key";
 
 export const Route = createFileRoute("/_authenticated/admin")({
   component: AdminPage,
 });
 
-const LIVE_WINDOW_MS = 45_000;
-const ACTIVE_WINDOW_MS = 5 * 60_000;
-const RECENT_PATH_POINTS_PER_USER = 30;
+const ACTIVE_WINDOW_MS = 2 * 60_000;
+const OFFLINE_WINDOW_MS = 5 * 60_000;
+const RECENT_PATH_POINTS_PER_TRACKER = 40;
 const RECENT_PATH_FETCH_LIMIT = 5_000;
+const LOCATION_TABLES = ["locations"] as const;
+
+type TrackingStatus = "ACTIVE" | "IDLE" | "OFFLINE";
+type VisibilityFilter = "active" | "inactive" | "all";
 
 type LocationPoint = {
   lat: number;
@@ -30,9 +37,12 @@ type LocationPoint = {
   created_at: string;
 };
 
-type LatestLoc = {
+type TrackingDevice = {
   id: string;
+  tracker_id: string;
   user_id: string;
+  session_id: string | null;
+  device_id: string | null;
   latitude: number;
   longitude: number;
   accuracy: number | null;
@@ -41,6 +51,13 @@ type LatestLoc = {
   email: string;
   trackerLabel: string;
   color: string;
+  status: TrackingStatus;
+  is_active: boolean;
+  ageMs: number;
+  network_type: string | null;
+  connection_type: string | null;
+  is_connected: boolean | null;
+  is_internet_reachable: boolean | null;
   path: LocationPoint[];
 };
 
@@ -54,29 +71,29 @@ type TrackingSession = {
   end_latitude: number | null;
   end_longitude: number | null;
   status: string;
+  is_active: boolean | null;
+  last_seen: string | null;
+  device_id: string | null;
+  connection_type: string | null;
+  device_label: string | null;
 };
 
 type LocationHistoryRow = {
   id: string;
   user_id: string;
   session_id: string | null;
+  device_id?: string | null;
   latitude: number;
   longitude: number;
   accuracy: number | null;
   network_type?: string | null;
+  connection_type?: string | null;
   is_connected?: boolean | null;
   is_internet_reachable?: boolean | null;
   created_at: string;
 };
 
-type DbLocation = {
-  id?: string;
-  user_id: string;
-  session_id?: string | null;
-  latitude: number;
-  longitude: number;
-  accuracy?: number | null;
-  created_at?: string;
+type DbLocation = LocationHistoryRow & {
   timestamp?: string;
 };
 
@@ -86,80 +103,254 @@ type DbProfile = {
   email: string;
 };
 
-function colorForUser(userId: string) {
+type LocationTableName = (typeof LOCATION_TABLES)[number];
+
+function colorForTracker(trackerId: string) {
   let hash = 0;
-  for (let i = 0; i < userId.length; i += 1) {
-    hash = userId.charCodeAt(i) + ((hash << 5) - hash);
+  for (let i = 0; i < trackerId.length; i += 1) {
+    hash = trackerId.charCodeAt(i) + ((hash << 5) - hash);
   }
   const hue = Math.abs(hash) % 360;
-  return `hsl(${hue} 78% 46%)`;
+  return `hsl(${hue} 78% 44%)`;
 }
 
-function isLive(createdAt: string) {
-  return Date.now() - new Date(createdAt).getTime() < LIVE_WINDOW_MS;
+function shortId(id: string) {
+  return id.slice(0, 8);
 }
 
-function isActive(createdAt: string) {
-  return Date.now() - new Date(createdAt).getTime() < ACTIVE_WINDOW_MS;
+function trackerKey(location: Pick<DbLocation, "session_id" | "user_id" | "device_id">) {
+  return location.session_id ?? location.device_id ?? location.user_id;
 }
 
-function shortId(userId: string) {
-  return userId.slice(0, 8);
+function locationTime(location: Pick<DbLocation, "created_at" | "timestamp">) {
+  return location.created_at ?? location.timestamp ?? new Date(0).toISOString();
 }
 
-function personLabel(index: number) {
-  return `Person ${index + 1}`;
+function locationMillis(location: Pick<DbLocation, "created_at" | "timestamp">) {
+  const time = new Date(locationTime(location)).getTime();
+  return Number.isFinite(time) ? time : 0;
 }
 
-function locationTime(location: DbLocation) {
-  return location.created_at ?? location.timestamp ?? new Date().toISOString();
+function statusFor(createdAt: string): TrackingStatus {
+  const ageMs = Date.now() - new Date(createdAt).getTime();
+  if (ageMs <= ACTIVE_WINDOW_MS) return "ACTIVE";
+  if (ageMs <= OFFLINE_WINDOW_MS) return "IDLE";
+  return "OFFLINE";
 }
 
-function latestPerUser(locations: DbLocation[]) {
-  const byUser = new Map<string, DbLocation>();
+function statusVariant(status: TrackingStatus) {
+  return status === "ACTIVE" ? "default" : "secondary";
+}
+
+function hasValidCoordinates(location: DbLocation) {
+  return (
+    typeof location.latitude === "number" &&
+    typeof location.longitude === "number" &&
+    Number.isFinite(location.latitude) &&
+    Number.isFinite(location.longitude)
+  );
+}
+
+function latestPerTracker(locations: DbLocation[]) {
+  const byTracker = new Map<string, DbLocation>();
 
   for (const location of locations) {
-    if (!byUser.has(location.user_id)) byUser.set(location.user_id, location);
+    const key = trackerKey(location);
+    const current = byTracker.get(key);
+    if (!current || locationMillis(location) > locationMillis(current)) {
+      byTracker.set(key, location);
+    }
   }
 
-  return Array.from(byUser.values());
+  return Array.from(byTracker.values());
 }
 
-async function fetchRecentLocations(orderColumn: "created_at" | "timestamp") {
+function matchesSearch(device: TrackingDevice, search: string) {
+  const value = search.trim().toLowerCase();
+  if (!value) return true;
+  return [
+    device.trackerLabel,
+    device.user_id,
+    device.session_id ?? "",
+    device.device_id ?? "",
+    device.name,
+    device.email,
+    device.network_type ?? "",
+  ].some((field) => field.toLowerCase().includes(value));
+}
+
+async function selectLocations(
+  table: LocationTableName,
+  orderColumn: "created_at" | "timestamp",
+  includeTrackingColumns: boolean,
+) {
+  const selectColumns = includeTrackingColumns
+    ? `id, user_id, session_id, device_id, latitude, longitude, accuracy, network_type, connection_type, is_connected, is_internet_reachable, ${orderColumn}`
+    : `id, user_id, session_id, latitude, longitude, accuracy, network_type, is_connected, is_internet_reachable, ${orderColumn}`;
+
   const { data, error } = await supabase
-    .from("locations")
-    .select(`id, user_id, latitude, longitude, accuracy, ${orderColumn}`)
+    .from(table)
+    .select(selectColumns)
     .order(orderColumn, { ascending: false })
     .limit(RECENT_PATH_FETCH_LIMIT)
     .returns<DbLocation[]>();
 
-  if (error) return null;
-  return data ?? [];
+  console.log("Supabase response:", data);
+  console.log("Supabase error:", error);
+
+  return { data, error };
+}
+
+async function fetchRecentLocations(orderColumn: "created_at" | "timestamp") {
+  for (const table of LOCATION_TABLES) {
+    const primary = await selectLocations(table, orderColumn, true);
+    if (!primary.error) return primary.data ?? [];
+
+    console.error("[Admin] Failed to fetch recent locations", {
+      table,
+      orderColumn,
+      message: primary.error.message,
+      details: primary.error.details,
+    });
+
+    const fallback = await selectLocations(table, orderColumn, false);
+    if (!fallback.error) return fallback.data ?? [];
+
+    const minimal = await supabase
+      .from(table)
+      .select(`id, user_id, latitude, longitude, ${orderColumn}`)
+      .order(orderColumn, { ascending: false })
+      .limit(RECENT_PATH_FETCH_LIMIT)
+      .returns<DbLocation[]>();
+
+    console.log("Supabase response:", minimal.data);
+    console.log("Supabase error:", minimal.error);
+
+    if (!minimal.error) return minimal.data ?? [];
+  }
+
+  return null;
 }
 
 async function fetchLocationHistory() {
-  const withNetwork = await supabase
-    .from("locations")
-    .select(
-      "id, user_id, session_id, latitude, longitude, accuracy, network_type, is_connected, is_internet_reachable, created_at",
-    )
-    .order("created_at", { ascending: false })
-    .limit(100)
-    .returns<LocationHistoryRow[]>();
+  for (const table of LOCATION_TABLES) {
+    const primary = await supabase
+      .from(table)
+      .select(
+        "id, user_id, session_id, device_id, latitude, longitude, accuracy, network_type, connection_type, is_connected, is_internet_reachable, created_at",
+      )
+      .order("created_at", { ascending: false })
+      .limit(150)
+      .returns<LocationHistoryRow[]>();
 
-  if (!withNetwork.error) return { data: withNetwork.data ?? [], error: null };
+    console.log("Supabase response:", primary.data);
+    console.log("Supabase error:", primary.error);
 
-  const basic = await supabase
-    .from("locations")
-    .select("id, user_id, session_id, latitude, longitude, accuracy, created_at")
-    .order("created_at", { ascending: false })
-    .limit(100)
-    .returns<LocationHistoryRow[]>();
+    if (!primary.error) return { data: primary.data ?? [], error: null };
 
-  return { data: basic.data ?? [], error: basic.error ?? withNetwork.error };
+    const fallback = await supabase
+      .from(table)
+      .select(
+        "id, user_id, session_id, latitude, longitude, accuracy, network_type, is_connected, is_internet_reachable, created_at",
+      )
+      .order("created_at", { ascending: false })
+      .limit(150)
+      .returns<LocationHistoryRow[]>();
+
+    console.log("Supabase response:", fallback.data);
+    console.log("Supabase error:", fallback.error);
+
+    if (!fallback.error) return { data: fallback.data ?? [], error: fallback.error };
+
+    const minimal = await supabase
+      .from(table)
+      .select("id, user_id, latitude, longitude, created_at")
+      .order("created_at", { ascending: false })
+      .limit(150)
+      .returns<LocationHistoryRow[]>();
+
+    console.log("Supabase response:", minimal.data);
+    console.log("Supabase error:", minimal.error);
+
+    if (!minimal.error) return { data: minimal.data ?? [], error: null };
+  }
+
+  return { data: [], error: new Error("No readable locations table") };
 }
 
-function UserPaths({ users }: { users: LatestLoc[] }) {
+async function fetchTrackingSessions() {
+  const { data, error } = await supabase
+    .from("tracking_sessions")
+    .select(
+      "id, user_id, started_at, ended_at, start_latitude, start_longitude, end_latitude, end_longitude, status, is_active, last_seen, device_id, connection_type, device_label",
+    )
+    .order("started_at", { ascending: false })
+    .limit(500)
+    .returns<TrackingSession[]>();
+
+  console.log("Supabase response:", data);
+  console.log("Supabase error:", error);
+
+  if (!error) return { data: data ?? [], error };
+
+  const fallback = await supabase
+    .from("tracking_sessions")
+    .select(
+      "id, user_id, started_at, ended_at, start_latitude, start_longitude, end_latitude, end_longitude, status",
+    )
+    .order("started_at", { ascending: false })
+    .limit(500)
+    .returns<TrackingSession[]>();
+
+  console.log("Supabase response:", fallback.data);
+  console.log("Supabase error:", fallback.error);
+
+  if (!fallback.error) return { data: fallback.data ?? [], error: null };
+
+  console.warn(
+    "[Admin] Tracking sessions are not readable. Rendering locations without session state.",
+    {
+      message: error.message,
+      fallbackMessage: fallback.error?.message,
+    },
+  );
+  return { data: [], error: fallback.error ?? error };
+}
+
+async function fetchProfiles() {
+  const { data, error } = await supabase.from("profiles").select("id, name, email");
+  console.log("Supabase response:", data);
+  console.log("Supabase error:", error);
+  return { data, error };
+}
+
+async function assertReadableTables() {
+  const checks = await Promise.allSettled([
+    supabase.from("tracking_sessions").select("id", { count: "exact", head: true }),
+    supabase.from("locations").select("id", { count: "exact", head: true }),
+  ]);
+
+  checks.forEach((result, index) => {
+    if (result.status === "rejected") {
+      console.log("Supabase response:", {
+        table: ["tracking_sessions", "locations"][index],
+        count: null,
+        status: "rejected",
+      });
+      console.log("Supabase error:", result.reason);
+      return;
+    }
+
+    console.log("Supabase response:", {
+      table: ["tracking_sessions", "locations"][index],
+      count: result.value.count,
+      status: result.value.status,
+    });
+    console.log("Supabase error:", result.value.error);
+  });
+}
+
+function UserPaths({ users }: { users: TrackingDevice[] }) {
   const map = useMap();
 
   useEffect(() => {
@@ -172,7 +363,7 @@ function UserPaths({ users }: { users: LatestLoc[] }) {
           path: user.path.map((point) => ({ lat: point.lat, lng: point.lng })),
           geodesic: true,
           strokeColor: user.color,
-          strokeOpacity: 0.85,
+          strokeOpacity: user.status === "ACTIVE" ? 0.9 : 0.45,
           strokeWeight: 4,
         });
         polyline.setMap(map);
@@ -187,82 +378,31 @@ function UserPaths({ users }: { users: LatestLoc[] }) {
   return null;
 }
 
-function UserMapLabels({ users, selected }: { users: LatestLoc[]; selected: string | null }) {
-  const map = useMap();
+function markerPosition(user: TrackingDevice, index: number, users: TrackingDevice[]) {
+  const sameCoordinateIndex = users
+    .slice(0, index)
+    .filter(
+      (item) =>
+        Math.abs(item.latitude - user.latitude) < 0.00001 &&
+        Math.abs(item.longitude - user.longitude) < 0.00001,
+    ).length;
 
-  useEffect(() => {
-    if (!map) return;
+  if (sameCoordinateIndex === 0) return { lat: user.latitude, lng: user.longitude };
 
-    const overlays = users.map((user) => {
-      class LabelOverlay extends google.maps.OverlayView {
-        private div?: HTMLDivElement;
-
-        onAdd() {
-          const div = document.createElement("div");
-          div.style.position = "absolute";
-          div.style.transform = "translate(-50%, -112px)";
-          div.style.background = selected === user.user_id ? "#111827" : "#ffffff";
-          div.style.border = `2px solid ${user.color}`;
-          div.style.borderRadius = "8px";
-          div.style.boxShadow = "0 10px 24px rgba(15, 23, 42, 0.18)";
-          div.style.color = selected === user.user_id ? "#ffffff" : "#0f172a";
-          div.style.fontFamily = "Inter, ui-sans-serif, system-ui, sans-serif";
-          div.style.fontSize = "12px";
-          div.style.fontWeight = "700";
-          div.style.lineHeight = "1.25";
-          div.style.padding = "7px 9px";
-          div.style.pointerEvents = "none";
-          div.style.whiteSpace = "nowrap";
-
-          const title = document.createElement("div");
-          title.textContent = user.trackerLabel;
-
-          const coords = document.createElement("div");
-          coords.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
-          coords.style.fontSize = "10px";
-          coords.style.fontWeight = "500";
-          coords.style.marginTop = "2px";
-          coords.style.opacity = ".78";
-          coords.textContent = `${user.latitude.toFixed(5)}, ${user.longitude.toFixed(5)}`;
-
-          div.append(title, coords);
-          this.div = div;
-          this.getPanes()?.overlayMouseTarget.appendChild(div);
-        }
-
-        draw() {
-          const projection = this.getProjection();
-          const point = projection.fromLatLngToDivPixel(
-            new google.maps.LatLng(user.latitude, user.longitude),
-          );
-          if (!point || !this.div) return;
-          this.div.style.left = `${point.x}px`;
-          this.div.style.top = `${point.y}px`;
-        }
-
-        onRemove() {
-          this.div?.remove();
-          this.div = undefined;
-        }
-      }
-
-      const overlay = new LabelOverlay();
-      overlay.setMap(map);
-      return overlay;
-    });
-
-    return () => overlays.forEach((overlay) => overlay.setMap(null));
-  }, [map, selected, users]);
-
-  return null;
+  const angle = sameCoordinateIndex * 1.0472;
+  const radius = 0.00003 * Math.ceil(sameCoordinateIndex / 6);
+  return {
+    lat: user.latitude + Math.sin(angle) * radius,
+    lng: user.longitude + Math.cos(angle) * radius,
+  };
 }
 
 function FitMapToUsers({
   users,
   selectedUser,
 }: {
-  users: LatestLoc[];
-  selectedUser: LatestLoc | null;
+  users: TrackingDevice[];
+  selectedUser: TrackingDevice | null;
 }) {
   const map = useMap();
 
@@ -294,236 +434,362 @@ function AdminPage() {
   const navigate = useNavigate();
   const canUseAdmin = isAdmin || import.meta.env.DEV;
   const mapsKey = getMapsKey();
-  const [rows, setRows] = useState<LatestLoc[]>([]);
+  const [devices, setDevices] = useState<TrackingDevice[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [visibilityFilter, setVisibilityFilter] = useState<VisibilityFilter>("active");
+  const [search, setSearch] = useState("");
   const [loadStatus, setLoadStatus] = useState("Waiting for live locations");
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [showAllHistory, setShowAllHistory] = useState(false);
+  const [lastLoadedAt, setLastLoadedAt] = useState<Date | null>(null);
   const [sessions, setSessions] = useState<TrackingSession[]>([]);
   const [historyRows, setHistoryRows] = useState<LocationHistoryRow[]>([]);
+  const [realtimeNonce, setRealtimeNonce] = useState(0);
   const [, tick] = useState(0);
+  const loadRequestIdRef = useRef(0);
 
   useEffect(() => {
     if (!loading && !canUseAdmin) navigate({ to: "/tracker" });
   }, [loading, canUseAdmin, navigate]);
 
   useEffect(() => {
-    const i = setInterval(() => tick((t) => t + 1), 5_000);
-    return () => clearInterval(i);
+    const i = window.setInterval(() => tick((t) => t + 1), 5_000);
+    return () => window.clearInterval(i);
   }, []);
 
   const loadAll = useCallback(async () => {
+    const loadRequestId = loadRequestIdRef.current + 1;
+    loadRequestIdRef.current = loadRequestId;
     setLoadError(null);
-    const [
-      { data: latestRows, error: latestError },
-      { data: profiles, error: profilesError },
-      { data: sessionRows, error: sessionsError },
-      { data: history, error: historyError },
-    ] = await Promise.all([
-      supabase
-        .from("latest_locations")
-        .select("id, user_id, latitude, longitude, accuracy, created_at")
-        .order("created_at", { ascending: false }),
-      supabase.from("profiles").select("id, name, email"),
-      supabase
-        .from("tracking_sessions")
-        .select(
-          "id, user_id, started_at, ended_at, start_latitude, start_longitude, end_latitude, end_longitude, status",
-        )
-        .order("started_at", { ascending: false })
-        .limit(25)
-        .returns<TrackingSession[]>(),
+
+    void assertReadableTables();
+
+    const [{ data: profiles, error: profilesError }, { data: sessionRows, error: sessionsError }] =
+      await Promise.all([fetchProfiles(), fetchTrackingSessions()]);
+
+    const [recentLocations, { data: history, error: historyError }] = await Promise.all([
+      fetchRecentLocations("created_at").then(
+        async (rows) => rows ?? (await fetchRecentLocations("timestamp")) ?? [],
+      ),
       fetchLocationHistory(),
     ]);
 
-    setSessions(sessionRows ?? []);
-    setHistoryRows(history ?? []);
-
-    let latestLocations = (latestRows ?? []) as DbLocation[];
-    let recentLocations: DbLocation[] = [];
-
-    if (latestError) {
-      recentLocations =
-        (await fetchRecentLocations("created_at")) ??
-        (await fetchRecentLocations("timestamp")) ??
-        [];
-      latestLocations = latestPerUser(recentLocations);
-    } else {
-      recentLocations =
-        (await fetchRecentLocations("created_at")) ??
-        (await fetchRecentLocations("timestamp")) ??
-        [];
+    if (loadRequestId !== loadRequestIdRef.current) {
+      console.log("[Admin] Ignoring stale location fetch response", {
+        loadRequestId,
+        latestRequestId: loadRequestIdRef.current,
+      });
+      return;
     }
 
-    const warnings = [];
-    if (profilesError) {
-      warnings.push("Profiles are not readable, so showing tracked devices without names.");
-    }
-    if (sessionsError || historyError) {
-      warnings.push("Run the tracking_sessions migration in Supabase to see full session history.");
-    }
-    setLoadError(warnings.length ? warnings.join(" ") : null);
-
+    const validLocations = recentLocations.filter(hasValidCoordinates);
+    const latestLocations = latestPerTracker(validLocations);
     const profMap = new Map(
       ((profiles ?? []) as DbProfile[]).map((profile) => [profile.id, profile]),
     );
-    const pathsByUser = new Map<string, LocationPoint[]>();
+    const sessionMap = new Map((sessionRows ?? []).map((session) => [session.id, session]));
+    const pathsByTracker = new Map<string, LocationPoint[]>();
 
-    for (const loc of recentLocations) {
-      const path = pathsByUser.get(loc.user_id) ?? [];
-      if (path.length < RECENT_PATH_POINTS_PER_USER) {
+    for (const loc of validLocations) {
+      const key = trackerKey(loc);
+      const path = pathsByTracker.get(key) ?? [];
+      if (path.length < RECENT_PATH_POINTS_PER_TRACKER) {
         path.push({
           lat: loc.latitude,
           lng: loc.longitude,
           created_at: locationTime(loc),
         });
-        pathsByUser.set(loc.user_id, path);
+        pathsByTracker.set(key, path);
       }
     }
 
-    const orderedLatestLocations = [...latestLocations].sort((a, b) =>
-      a.user_id.localeCompare(b.user_id),
-    );
-
-    setRows(
-      orderedLatestLocations.map((loc, index) => {
+    const nextDevices = latestLocations
+      .sort((a, b) => trackerKey(a).localeCompare(trackerKey(b)))
+      .map((loc, index) => {
+        const key = trackerKey(loc);
         const profile = profMap.get(loc.user_id);
+        const session = loc.session_id ? sessionMap.get(loc.session_id) : null;
+        const createdAt = locationTime(loc);
+        const status = statusFor(createdAt);
+        const isActiveSharing = session
+          ? session.status === "active" && session.is_active !== false && status !== "OFFLINE"
+          : status === "ACTIVE";
         return {
-          id: loc.id ?? `${loc.user_id}-${locationTime(loc)}`,
+          id: loc.id,
+          tracker_id: key,
           user_id: loc.user_id,
+          session_id: loc.session_id ?? null,
+          device_id: loc.device_id ?? null,
           latitude: loc.latitude,
           longitude: loc.longitude,
           accuracy: loc.accuracy ?? null,
-          created_at: locationTime(loc),
+          created_at: createdAt,
           name: profile?.name || "Unknown user",
           email: profile?.email ?? "",
-          trackerLabel: personLabel(index),
-          color: colorForUser(loc.user_id),
-          path: [...(pathsByUser.get(loc.user_id) ?? [])].reverse(),
+          trackerLabel: loc.device_id ? `Device ${shortId(loc.device_id)}` : `Device ${index + 1}`,
+          color: colorForTracker(key),
+          status,
+          is_active: isActiveSharing,
+          ageMs: Date.now() - new Date(createdAt).getTime(),
+          network_type: loc.network_type ?? null,
+          connection_type: loc.connection_type ?? loc.network_type ?? null,
+          is_connected: loc.is_connected ?? null,
+          is_internet_reachable: loc.is_internet_reachable ?? null,
+          path: [...(pathsByTracker.get(key) ?? [])].reverse(),
         };
+      });
+
+    const activeUsers = nextDevices.filter(
+      (device) => device.status === "ACTIVE" && device.is_active,
+    );
+    console.log("Active sessions:", activeUsers);
+    setDevices(nextDevices);
+    setSessions(sessionRows ?? []);
+    setHistoryRows(history ?? []);
+    setLastLoadedAt(new Date());
+    setLoadStatus(
+      nextDevices.length
+        ? `Tracking ${nextDevices.length} device${nextDevices.length === 1 ? "" : "s"}`
+        : "No tracking data found. Start sharing from a phone.",
+    );
+
+    const warnings = [];
+    if (profilesError) warnings.push("Profiles are not readable, so names may be missing.");
+    if (sessionsError)
+      warnings.push("Session state is not readable; rendering live rows from locations.");
+    if (historyError)
+      warnings.push("Location history query failed; using recent live locations only.");
+    setLoadError(warnings.length ? warnings.join(" ") : null);
+  }, []);
+
+  const closeStaleSessions = useCallback(async () => {
+    const latestByTracker = new Map(devices.map((device) => [device.tracker_id, device]));
+    const staleActiveSessions = sessions.filter((session) => {
+      if (session.status !== "active") return false;
+      const latest = latestByTracker.get(session.id);
+      return !latest || latest.status === "OFFLINE";
+    });
+
+    if (staleActiveSessions.length === 0) {
+      setLoadStatus("No stale active sessions to remove.");
+      return;
+    }
+
+    await Promise.all(
+      staleActiveSessions.map((session) => {
+        const latest = latestByTracker.get(session.id);
+        return supabase
+          .from("tracking_sessions")
+          .update({
+            status: "ended",
+            is_active: false,
+            ended_at: new Date().toISOString(),
+            end_latitude: latest?.latitude ?? null,
+            end_longitude: latest?.longitude ?? null,
+            end_accuracy: latest?.accuracy ?? null,
+          })
+          .eq("id", session.id);
       }),
     );
-    setLoadStatus(
-      latestLocations.length
-        ? `Loaded ${latestLocations.length} tracked device${latestLocations.length === 1 ? "" : "s"}`
-        : latestError
-          ? "No readable locations found. If the phone sent data, your web user may not have admin RLS access."
-          : "No locations found yet. Start sharing from a phone.",
-    );
-  }, []);
+
+    setLoadStatus(`Removed ${staleActiveSessions.length} stale session(s).`);
+    await loadAll();
+  }, [devices, loadAll, sessions]);
 
   useEffect(() => {
     if (!canUseAdmin) return;
 
     loadAll();
+    let active = true;
     const channel = supabase
-      .channel("admin-locations-live")
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "locations" }, () =>
-        loadAll(),
+      .channel(`admin-locations-live-${realtimeNonce}-${Date.now()}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "locations" }, (payload) => {
+        console.log("Realtime update received:", payload.new ?? payload.old ?? payload);
+        loadAll();
+      })
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "tracking_sessions" },
+        (payload) => {
+          console.log("Realtime update received:", payload.new ?? payload.old ?? payload);
+          loadAll();
+        },
       )
-      .subscribe();
+      .subscribe((status, error) => {
+        console.log("[Admin] Realtime subscription status", { status, error });
+        if (
+          active &&
+          (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED")
+        ) {
+          window.setTimeout(() => setRealtimeNonce((value) => value + 1), 1_000);
+        }
+      });
+    const poll = window.setInterval(loadAll, 10_000);
+    const reconnect = () => {
+      console.log("[Admin] Reconnecting realtime and refreshing locations");
+      setRealtimeNonce((value) => value + 1);
+      void loadAll();
+    };
+    window.addEventListener("online", reconnect);
+    window.addEventListener("focus", reconnect);
 
     return () => {
+      active = false;
+      window.clearInterval(poll);
+      window.removeEventListener("online", reconnect);
+      window.removeEventListener("focus", reconnect);
       supabase.removeChannel(channel);
     };
-  }, [canUseAdmin, loadAll]);
+  }, [canUseAdmin, loadAll, realtimeNonce]);
 
-  const center = useMemo(() => {
-    if (!rows.length) return { lat: 20, lng: 0 };
-    const lat = rows.reduce((sum, row) => sum + row.latitude, 0) / rows.length;
-    const lng = rows.reduce((sum, row) => sum + row.longitude, 0) / rows.length;
-    return { lat, lng };
-  }, [rows]);
+  const filteredDevices = useMemo(() => {
+    return devices.filter((device) => {
+      const matchesVisibility =
+        visibilityFilter === "all" ||
+        (visibilityFilter === "active" && device.status === "ACTIVE") ||
+        (visibilityFilter === "inactive" && device.status !== "ACTIVE");
+      return matchesVisibility && matchesSearch(device, search);
+    });
+  }, [devices, search, visibilityFilter]);
 
-  const visibleRows = showAllHistory ? rows : rows.filter((row) => isActive(row.created_at));
-  const selectedRow = visibleRows.find((row) => row.user_id === selected) ?? null;
-  const liveCount = visibleRows.filter((row) => isLive(row.created_at)).length;
-  const idleCount = visibleRows.length - liveCount;
+  const mapDevices = filteredDevices.filter(
+    (device) => device.status === "ACTIVE" && device.is_active,
+  );
+  const selectedRow = filteredDevices.find((row) => row.tracker_id === selected) ?? null;
+  const selectedMapRow = mapDevices.find((row) => row.tracker_id === selected) ?? null;
+  const liveCount = devices.filter((row) => row.status === "ACTIVE" && row.is_active).length;
+  const idleCount = devices.filter((row) => row.status === "IDLE").length;
+  const offlineCount = devices.filter((row) => row.status === "OFFLINE").length;
+  const markers = mapDevices.map((device, index) => ({
+    trackerId: device.tracker_id,
+    position: markerPosition(device, index, mapDevices),
+    status: device.status,
+  }));
+  markers.forEach((marker) => console.log("Rendering marker:", marker));
 
   if (loading || !canUseAdmin)
     return <div className="p-6 text-muted-foreground">Checking permissions...</div>;
 
   return (
-    <div className="container mx-auto grid gap-4 px-4 py-6 lg:grid-cols-[390px_1fr]">
+    <div className="container mx-auto grid gap-4 px-4 py-6 lg:grid-cols-[420px_1fr]">
       <Card className="lg:max-h-[78vh] lg:overflow-auto">
         <CardHeader>
-          <div className="space-y-3">
+          <div className="space-y-4">
             <div className="flex items-center justify-between gap-3">
-              <CardTitle className="text-base">Tracking Control</CardTitle>
-              <Badge variant={liveCount ? "default" : "secondary"}>{liveCount} LIVE</Badge>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <ShieldCheck className="h-4 w-4" /> GeoTrack Admin
+              </CardTitle>
+              <Badge variant={liveCount ? "default" : "secondary"}>{liveCount} ACTIVE</Badge>
             </div>
             <p className="text-xs text-muted-foreground">{loadStatus}</p>
+            {lastLoadedAt && (
+              <p className="text-xs text-muted-foreground">
+                Last updated {lastLoadedAt.toLocaleTimeString()}
+              </p>
+            )}
             {loadError && <p className="text-xs text-destructive">{loadError}</p>}
-            <div className="grid grid-cols-3 gap-2 text-center text-xs">
+            <div className="grid grid-cols-4 gap-2 text-center text-xs">
               <div className="rounded-md border p-2">
-                <div className="font-mono text-lg font-semibold">{visibleRows.length}</div>
-                <div className="text-muted-foreground">Devices</div>
+                <div className="font-mono text-lg font-semibold">{devices.length}</div>
+                <div className="text-muted-foreground">Total</div>
               </div>
               <div className="rounded-md border p-2">
                 <div className="font-mono text-lg font-semibold">{liveCount}</div>
-                <div className="text-muted-foreground">Live</div>
+                <div className="text-muted-foreground">Active</div>
               </div>
               <div className="rounded-md border p-2">
                 <div className="font-mono text-lg font-semibold">{idleCount}</div>
                 <div className="text-muted-foreground">Idle</div>
               </div>
+              <div className="rounded-md border p-2">
+                <div className="font-mono text-lg font-semibold">{offlineCount}</div>
+                <div className="text-muted-foreground">Offline</div>
+              </div>
             </div>
-            <button
-              className="text-left text-xs font-medium text-primary"
-              onClick={() => setShowAllHistory((value) => !value)}
-              type="button"
-            >
-              {showAllHistory ? "Showing all historical devices" : "Showing active devices only"}
-            </button>
+            <div className="grid grid-cols-3 gap-2">
+              <Button
+                size="sm"
+                variant={visibilityFilter === "active" ? "default" : "outline"}
+                onClick={() => setVisibilityFilter("active")}
+              >
+                Active Users
+              </Button>
+              <Button
+                size="sm"
+                variant={visibilityFilter === "inactive" ? "default" : "outline"}
+                onClick={() => setVisibilityFilter("inactive")}
+              >
+                Inactive Users
+              </Button>
+              <Button
+                size="sm"
+                variant={visibilityFilter === "all" ? "default" : "outline"}
+                onClick={() => setVisibilityFilter("all")}
+              >
+                Show All
+              </Button>
+            </div>
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Search className="pointer-events-none absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+                <Input
+                  className="pl-8"
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search user or session"
+                  value={search}
+                />
+              </div>
+              <Button size="icon" variant="outline" onClick={loadAll} title="Refresh tracking data">
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            </div>
+            <Button variant="outline" className="w-full" onClick={closeStaleSessions}>
+              Remove stale sessions
+            </Button>
           </div>
         </CardHeader>
         <CardContent className="space-y-2">
-          {visibleRows.length === 0 && (
-            <p className="text-sm text-muted-foreground">
-              No active locations. Have a phone user start sharing, or show historical devices.
-            </p>
+          {filteredDevices.length === 0 && (
+            <p className="text-sm text-muted-foreground">No devices match the current filters.</p>
           )}
-          {visibleRows.map((row) => {
-            const live = isLive(row.created_at);
-            return (
-              <button
-                key={row.user_id}
-                onClick={() => setSelected(row.user_id)}
-                className={`w-full rounded-md border p-3 text-left text-sm transition-colors hover:bg-accent ${
-                  selected === row.user_id ? "border-primary bg-accent" : ""
-                }`}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className="h-3 w-3 shrink-0 rounded-full"
-                        style={{ backgroundColor: row.color }}
-                      />
-                      <span className="truncate font-medium">{row.trackerLabel}</span>
-                    </div>
-                    <div className="mt-1 truncate text-xs text-muted-foreground">
-                      {row.name} {row.email ? `(${row.email})` : ""}
-                    </div>
-                    <div className="mt-1 text-[11px] text-muted-foreground">
-                      User ID: {shortId(row.user_id)}
-                    </div>
-                    <div className="mt-2 font-mono text-[11px] text-muted-foreground">
-                      {row.latitude.toFixed(5)}, {row.longitude.toFixed(5)}
-                    </div>
+          {filteredDevices.map((row) => (
+            <button
+              key={row.tracker_id}
+              onClick={() => setSelected(row.tracker_id)}
+              className={`w-full rounded-md border p-3 text-left text-sm transition-colors hover:bg-accent ${
+                selected === row.tracker_id ? "border-primary bg-accent" : ""
+              }`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="h-3 w-3 shrink-0 rounded-full"
+                      style={{ backgroundColor: row.color }}
+                    />
+                    <span className="truncate font-medium">{row.trackerLabel}</span>
                   </div>
-                  <div className="flex shrink-0 flex-col items-end gap-1">
-                    <Badge variant={live ? "default" : "secondary"} className="text-[10px]">
-                      {live ? "LIVE" : "IDLE"}
-                    </Badge>
-                    <span className="text-[11px] text-muted-foreground">
-                      {formatDistanceToNow(new Date(row.created_at), { addSuffix: true })}
-                    </span>
+                  <div className="mt-1 truncate text-xs text-muted-foreground">
+                    {row.name} {row.email ? `(${row.email})` : ""}
+                  </div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    User: {shortId(row.user_id)}
+                    {row.session_id ? ` / Session: ${shortId(row.session_id)}` : " / Legacy"}
+                  </div>
+                  <div className="mt-2 font-mono text-[11px] text-muted-foreground">
+                    {row.latitude.toFixed(6)}, {row.longitude.toFixed(6)}
                   </div>
                 </div>
-              </button>
-            );
-          })}
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  <Badge variant={statusVariant(row.status)} className="text-[10px]">
+                    {row.status}
+                  </Badge>
+                  <span className="text-[11px] text-muted-foreground">
+                    {formatDistanceToNow(new Date(row.created_at), { addSuffix: true })}
+                  </span>
+                </div>
+              </div>
+            </button>
+          ))}
         </CardContent>
       </Card>
 
@@ -532,63 +798,70 @@ function AdminPage() {
           <APIProvider apiKey={mapsKey}>
             <GMap
               mapId="admin"
-              defaultCenter={center}
-              defaultZoom={rows.length ? 12 : 2}
+              defaultCenter={{ lat: 20, lng: 0 }}
+              defaultZoom={mapDevices.length ? 12 : 2}
               gestureHandling="greedy"
               disableDefaultUI={false}
             >
-              <UserPaths users={visibleRows} />
-              <UserMapLabels users={visibleRows} selected={selected} />
-              <FitMapToUsers users={visibleRows} selectedUser={selectedRow} />
-              {visibleRows.map((row) => {
-                const selectedMarker = selected === row.user_id;
+              <UserPaths users={mapDevices} />
+              <FitMapToUsers users={mapDevices} selectedUser={selectedMapRow} />
+              {mapDevices.map((row, index) => {
+                const selectedMarker = selected === row.tracker_id;
+                const position = markerPosition(row, index, mapDevices);
                 return (
                   <AdvancedMarker
-                    key={row.user_id}
-                    position={{ lat: row.latitude, lng: row.longitude }}
-                    zIndex={selectedMarker ? 20 : 1}
-                    onClick={() => setSelected(row.user_id)}
+                    key={`${row.tracker_id}-${row.created_at}`}
+                    position={position}
+                    zIndex={selectedMarker ? 20 : row.status === "ACTIVE" ? 10 : 1}
+                    onClick={() => setSelected(row.tracker_id)}
                   >
                     <Pin
-                      background={row.color}
+                      background={row.status === "ACTIVE" ? row.color : "#64748b"}
                       borderColor={selectedMarker ? "#111827" : "#ffffff"}
                       glyphColor="#ffffff"
                       glyph={String(
-                        visibleRows.findIndex((item) => item.user_id === row.user_id) + 1,
+                        mapDevices.findIndex((item) => item.tracker_id === row.tracker_id) + 1,
                       )}
-                      scale={selectedMarker ? 1.25 : 1}
+                      scale={selectedMarker ? 1.25 : row.status === "ACTIVE" ? 1.1 : 0.95}
                     />
                   </AdvancedMarker>
                 );
               })}
-              {selectedRow && (
+              {selectedMapRow && (
                 <InfoWindow
-                  position={{ lat: selectedRow.latitude, lng: selectedRow.longitude }}
+                  position={{ lat: selectedMapRow.latitude, lng: selectedMapRow.longitude }}
                   onCloseClick={() => setSelected(null)}
                 >
                   <div className="space-y-1 text-sm">
                     <div className="flex items-center gap-2 font-semibold">
                       <span
                         className="h-2.5 w-2.5 rounded-full"
-                        style={{ backgroundColor: selectedRow.color }}
+                        style={{ backgroundColor: selectedMapRow.color }}
                       />
-                      {selectedRow.trackerLabel}
+                      {selectedMapRow.trackerLabel}
+                    </div>
+                    <Badge variant={statusVariant(selectedMapRow.status)}>
+                      {selectedMapRow.status}
+                    </Badge>
+                    <div className="text-xs text-muted-foreground">
+                      User: {selectedMapRow.user_id}
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      {selectedRow.name} {selectedRow.email ? `(${selectedRow.email})` : ""}
+                      Session: {selectedMapRow.session_id ?? "legacy"}
                     </div>
                     <div className="text-xs text-muted-foreground">
-                      User ID: {shortId(selectedRow.user_id)}
+                      Device: {selectedMapRow.device_id ?? "unknown"}
                     </div>
                     <div className="font-mono text-xs">
-                      {selectedRow.latitude.toFixed(5)}, {selectedRow.longitude.toFixed(5)}
+                      {selectedMapRow.latitude.toFixed(6)}, {selectedMapRow.longitude.toFixed(6)}
                     </div>
-                    {selectedRow.accuracy !== null && (
-                      <div className="text-xs">Accuracy: {Math.round(selectedRow.accuracy)} m</div>
-                    )}
                     <div className="text-xs">
-                      Last seen:{" "}
-                      {formatDistanceToNow(new Date(selectedRow.created_at), { addSuffix: true })}
+                      Last update: {new Date(selectedMapRow.created_at).toLocaleString()}
+                    </div>
+                    <div className="text-xs">
+                      Connection:{" "}
+                      {selectedMapRow.connection_type ?? selectedMapRow.network_type ?? "unknown"}
+                      {selectedMapRow.is_internet_reachable === false ? " / offline" : ""}
                     </div>
                   </div>
                 </InfoWindow>
@@ -601,8 +874,7 @@ function AdminPage() {
               <h2 className="text-lg font-semibold">Map disabled</h2>
               <p className="text-sm text-muted-foreground">
                 Add <span className="font-mono">VITE_GOOGLE_MAPS_API_KEY</span> to the web
-                <span className="font-mono"> .env</span> file to enable the map. Coordinate history
-                and tracking sessions are still available below.
+                <span className="font-mono"> .env</span> file to enable the map.
               </p>
             </div>
           </div>
@@ -612,15 +884,73 @@ function AdminPage() {
       <div className="lg:col-span-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Coordinate History</CardTitle>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Users className="h-4 w-4" /> Admin Tracking Table
+            </CardTitle>
           </CardHeader>
           <CardContent className="space-y-4">
+            <div className="overflow-auto rounded-md border">
+              <table className="w-full min-w-[1160px] text-left text-sm">
+                <thead className="bg-muted text-xs text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-2">User ID</th>
+                    <th className="px-3 py-2">Session ID</th>
+                    <th className="px-3 py-2">Device ID</th>
+                    <th className="px-3 py-2">Latitude</th>
+                    <th className="px-3 py-2">Longitude</th>
+                    <th className="px-3 py-2">Last Updated</th>
+                    <th className="px-3 py-2">Status</th>
+                    <th className="px-3 py-2">Online</th>
+                    <th className="px-3 py-2">Connection</th>
+                    <th className="px-3 py-2">Sharing</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredDevices.length === 0 && (
+                    <tr>
+                      <td className="px-3 py-4 text-muted-foreground" colSpan={10}>
+                        No tracking rows match the current filters.
+                      </td>
+                    </tr>
+                  )}
+                  {filteredDevices.map((row) => (
+                    <tr key={row.tracker_id} className="border-t">
+                      <td className="px-3 py-2 font-mono text-xs">{shortId(row.user_id)}</td>
+                      <td className="px-3 py-2 font-mono text-xs">
+                        {row.session_id ? shortId(row.session_id) : "legacy"}
+                      </td>
+                      <td className="px-3 py-2 font-mono text-xs">
+                        {row.device_id ? shortId(row.device_id) : "unknown"}
+                      </td>
+                      <td className="px-3 py-2 font-mono">{row.latitude.toFixed(6)}</td>
+                      <td className="px-3 py-2 font-mono">{row.longitude.toFixed(6)}</td>
+                      <td className="px-3 py-2">{new Date(row.created_at).toLocaleString()}</td>
+                      <td className="px-3 py-2">
+                        <Badge variant={statusVariant(row.status)}>{row.status}</Badge>
+                      </td>
+                      <td className="px-3 py-2">
+                        <Badge variant={row.status === "OFFLINE" ? "secondary" : "default"}>
+                          {row.status === "OFFLINE" ? "Offline" : "Online"}
+                        </Badge>
+                      </td>
+                      <td className="px-3 py-2">
+                        {row.connection_type ?? row.network_type ?? "unknown"}
+                        {row.is_internet_reachable === false ? " / no internet" : ""}
+                      </td>
+                      <td className="px-3 py-2">
+                        {row.is_active ? "active sharing" : "not sharing"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
             <div className="overflow-auto rounded-md border">
               <table className="w-full min-w-[980px] text-left text-sm">
                 <thead className="bg-muted text-xs text-muted-foreground">
                   <tr>
                     <th className="px-3 py-2">Time</th>
-                    <th className="px-3 py-2">Person</th>
                     <th className="px-3 py-2">Session</th>
                     <th className="px-3 py-2">Latitude</th>
                     <th className="px-3 py-2">Longitude</th>
@@ -629,93 +959,20 @@ function AdminPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {historyRows.length === 0 && (
-                    <tr>
-                      <td className="px-3 py-4 text-muted-foreground" colSpan={7}>
-                        No coordinate history yet.
+                  {historyRows.map((row) => (
+                    <tr key={row.id} className="border-t">
+                      <td className="px-3 py-2">{new Date(row.created_at).toLocaleString()}</td>
+                      <td className="px-3 py-2 font-mono text-xs">
+                        {row.session_id ? shortId(row.session_id) : "legacy"}
                       </td>
-                    </tr>
-                  )}
-                  {historyRows.map((row) => {
-                    const person = rows.find((item) => item.user_id === row.user_id);
-                    return (
-                      <tr key={row.id} className="border-t">
-                        <td className="px-3 py-2">{new Date(row.created_at).toLocaleString()}</td>
-                        <td className="px-3 py-2">
-                          {person?.trackerLabel ?? shortId(row.user_id)}
-                        </td>
-                        <td className="px-3 py-2 font-mono text-xs">
-                          {row.session_id ? row.session_id.slice(0, 8) : "legacy"}
-                        </td>
-                        <td className="px-3 py-2 font-mono">{row.latitude.toFixed(6)}</td>
-                        <td className="px-3 py-2 font-mono">{row.longitude.toFixed(6)}</td>
-                        <td className="px-3 py-2">
-                          {row.accuracy === null ? "unknown" : `${Math.round(row.accuracy)} m`}
-                        </td>
-                        <td className="px-3 py-2">
-                          {row.network_type ?? "unknown"}
-                          {row.is_internet_reachable === false ? " / offline" : ""}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="overflow-auto rounded-md border">
-              <table className="w-full min-w-[860px] text-left text-sm">
-                <thead className="bg-muted text-xs text-muted-foreground">
-                  <tr>
-                    <th className="px-3 py-2">Session</th>
-                    <th className="px-3 py-2">Person</th>
-                    <th className="px-3 py-2">Started</th>
-                    <th className="px-3 py-2">Start Coordinates</th>
-                    <th className="px-3 py-2">Ended</th>
-                    <th className="px-3 py-2">End Coordinates</th>
-                    <th className="px-3 py-2">Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sessions.length === 0 && (
-                    <tr>
-                      <td className="px-3 py-4 text-muted-foreground" colSpan={7}>
-                        No tracking sessions yet.
+                      <td className="px-3 py-2 font-mono">{row.latitude.toFixed(6)}</td>
+                      <td className="px-3 py-2 font-mono">{row.longitude.toFixed(6)}</td>
+                      <td className="px-3 py-2">
+                        {row.accuracy == null ? "unknown" : `${Math.round(row.accuracy)} m`}
                       </td>
+                      <td className="px-3 py-2">{row.network_type ?? "unknown"}</td>
                     </tr>
-                  )}
-                  {sessions.map((session) => {
-                    const person = rows.find((item) => item.user_id === session.user_id);
-                    return (
-                      <tr key={session.id} className="border-t">
-                        <td className="px-3 py-2 font-mono text-xs">{session.id.slice(0, 8)}</td>
-                        <td className="px-3 py-2">
-                          {person?.trackerLabel ?? shortId(session.user_id)}
-                        </td>
-                        <td className="px-3 py-2">
-                          {new Date(session.started_at).toLocaleString()}
-                        </td>
-                        <td className="px-3 py-2 font-mono">
-                          {session.start_latitude === null || session.start_longitude === null
-                            ? "unknown"
-                            : `${session.start_latitude.toFixed(6)}, ${session.start_longitude.toFixed(6)}`}
-                        </td>
-                        <td className="px-3 py-2">
-                          {session.ended_at ? new Date(session.ended_at).toLocaleString() : "-"}
-                        </td>
-                        <td className="px-3 py-2 font-mono">
-                          {session.end_latitude === null || session.end_longitude === null
-                            ? "-"
-                            : `${session.end_latitude.toFixed(6)}, ${session.end_longitude.toFixed(6)}`}
-                        </td>
-                        <td className="px-3 py-2">
-                          <Badge variant={session.status === "active" ? "default" : "secondary"}>
-                            {session.status}
-                          </Badge>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                  ))}
                 </tbody>
               </table>
             </div>

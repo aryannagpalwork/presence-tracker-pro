@@ -8,9 +8,11 @@ import { supabase } from "./supabase";
 export const BACKGROUND_LOCATION_TASK = "presence-tracker-background-location";
 
 export const SEND_INTERVAL_MS = 30_000;
+const MAX_LOCATION_AGE_MS = 2 * SEND_INTERVAL_MS;
 const LAST_SENT_KEY = "presence_tracker_last_sent";
 const SHARING_KEY = "presence_tracker_sharing";
 const SESSION_ID_KEY = "presence_tracker_session_id";
+const DEVICE_ID_KEY = "presence_tracker_device_id";
 
 export type LocationPoint = {
   latitude: number;
@@ -45,11 +47,12 @@ async function getNetworkSnapshot() {
 
 async function toLocationPoint(location: Location.LocationObject): Promise<LocationPoint> {
   const network = await getNetworkSnapshot();
+  const capturedAt = Number.isFinite(location.timestamp) ? location.timestamp : Date.now();
   return {
     latitude: location.coords.latitude,
     longitude: location.coords.longitude,
     accuracy: Number.isFinite(location.coords.accuracy ?? NaN) ? location.coords.accuracy : null,
-    createdAt: Date.now(),
+    createdAt: capturedAt,
     ...network,
   };
 }
@@ -67,7 +70,7 @@ async function clearLastSent() {
   await AsyncStorage.removeItem(LAST_SENT_KEY);
 }
 
-async function getSessionId() {
+export async function getStoredSessionId() {
   return AsyncStorage.getItem(SESSION_ID_KEY);
 }
 
@@ -87,6 +90,41 @@ export async function isSharingEnabled() {
   return (await AsyncStorage.getItem(SHARING_KEY)) === "true";
 }
 
+function makeStableId(prefix: string) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+export async function getDeviceId() {
+  const stored = await AsyncStorage.getItem(DEVICE_ID_KEY);
+  if (stored) return stored;
+
+  const deviceId = makeStableId("device");
+  await AsyncStorage.setItem(DEVICE_ID_KEY, deviceId);
+  return deviceId;
+}
+
+export async function restoreTrackingState() {
+  const [sharingEnabled, sessionId] = await Promise.all([isSharingEnabled(), getStoredSessionId()]);
+  return { sharingEnabled, sessionId };
+}
+
+export async function resumeTrackingSession(location?: Location.LocationObject) {
+  const sessionId = await getStoredSessionId();
+  if (!sessionId) return { sessionId: null, error: "No saved session" };
+
+  const point = location ? await toLocationPoint(location) : null;
+  const payload = {
+    status: "active",
+    ended_at: null,
+  };
+  console.log("Restoring tracking session:", { sessionId, payload });
+
+  const { error } = await supabase.from("tracking_sessions").update(payload).eq("id", sessionId);
+  if (error) return { sessionId: null, error: error.message };
+
+  return { sessionId, error: null };
+}
+
 export async function startTrackingSession(location?: Location.LocationObject) {
   const {
     data: { user },
@@ -97,17 +135,26 @@ export async function startTrackingSession(location?: Location.LocationObject) {
     return { sessionId: null, error: userError?.message ?? "Not signed in" };
   }
 
+  const existingSessionId = await getStoredSessionId();
+  if (existingSessionId && (await isSharingEnabled())) {
+    return resumeTrackingSession(location);
+  }
+
   const point = location ? await toLocationPoint(location) : null;
+  const deviceId = await getDeviceId();
+  if (point) console.log("GPS location fetched:", point);
+  const payload = {
+    user_id: user.id,
+    start_latitude: point?.latitude ?? null,
+    start_longitude: point?.longitude ?? null,
+    start_accuracy: point?.accuracy ?? null,
+    status: "active",
+    device_label: user.email ?? deviceId,
+  };
+  console.log("Sending to Supabase:", payload);
   const { data, error } = await supabase
     .from("tracking_sessions")
-    .insert({
-      user_id: user.id,
-      start_latitude: point?.latitude ?? null,
-      start_longitude: point?.longitude ?? null,
-      start_accuracy: point?.accuracy ?? null,
-      status: "active",
-      device_label: user.email ?? null,
-    })
+    .insert(payload)
     .select("id")
     .single();
 
@@ -119,7 +166,7 @@ export async function startTrackingSession(location?: Location.LocationObject) {
 }
 
 export async function endTrackingSession(location?: Location.LocationObject) {
-  const sessionId = await getSessionId();
+  const sessionId = await getStoredSessionId();
   if (!sessionId) return;
 
   const point = location ? await toLocationPoint(location) : null;
@@ -145,6 +192,23 @@ export async function sendLocationIfNeeded(
   const point = await toLocationPoint(location);
   const lastSent = await getLastSent();
   const intervalElapsed = !lastSent || point.createdAt - lastSent.createdAt >= SEND_INTERVAL_MS;
+  const locationAge = Date.now() - point.createdAt;
+
+  if (locationAge > MAX_LOCATION_AGE_MS) {
+    console.log("Ignoring stale coordinates:", point.latitude, point.longitude, {
+      capturedAt: new Date(point.createdAt).toISOString(),
+      ageMs: locationAge,
+    });
+    return { sent: false, message: "Ignoring stale GPS fix" };
+  }
+
+  if (lastSent && point.createdAt <= lastSent.createdAt) {
+    console.log("Ignoring stale coordinates:", point.latitude, point.longitude, {
+      capturedAt: new Date(point.createdAt).toISOString(),
+      lastSentAt: new Date(lastSent.createdAt).toISOString(),
+    });
+    return { sent: false, message: "Ignoring stale location timestamp" };
+  }
 
   if (!options.force && !intervalElapsed)
     return { sent: false, message: "Waiting for 30 second interval" };
@@ -158,8 +222,9 @@ export async function sendLocationIfNeeded(
     return { sent: false, message: "Not signed in", error: userError?.message };
   }
 
-  const sessionId = await getSessionId();
-  const { error } = await supabase.from("locations").insert({
+  const sessionId = await getStoredSessionId();
+  console.log("GPS location fetched:", point);
+  const payload = {
     user_id: user.id,
     session_id: sessionId,
     latitude: point.latitude,
@@ -168,21 +233,36 @@ export async function sendLocationIfNeeded(
     network_type: point.networkType,
     is_connected: point.isConnected,
     is_internet_reachable: point.isInternetReachable,
-  });
+  };
+  console.log("Sending to Supabase:", payload);
+  const { error } = await supabase.from("locations").insert(payload);
 
   if (error)
     return { sent: false, message: "Network or Supabase write failed", error: error.message };
+
+  if (sessionId) {
+    await supabase
+      .from("tracking_sessions")
+      .update({
+        status: "active",
+      })
+      .eq("id", sessionId);
+  }
 
   await setLastSent(point);
   return { sent: true, message: "Location sent", point };
 }
 
 TaskManager.defineTask(BACKGROUND_LOCATION_TASK, async ({ data, error }) => {
-  if (error) return;
+  if (error) {
+    console.log("Background location task error:", error);
+    return;
+  }
   if (!(await isSharingEnabled())) return;
 
   const locations =
     (data as { locations?: Location.LocationObject[] } | undefined)?.locations ?? [];
+  console.log("Background location task received:", locations.length);
   for (const location of locations) {
     await sendLocationIfNeeded(location);
   }

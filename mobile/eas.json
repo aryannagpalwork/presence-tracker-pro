@@ -18,8 +18,19 @@
       }
     },
     "production": {
+      "distribution": "store",
       "android": {
         "buildType": "app-bundle"
+      }
+    },
+    "preview-apk": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPO_PUBLIC_SUPABASE_URL": "https://iffrbkvgciimssrxfukt.supabase.co",
+        "EXPO_PUBLIC_SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmZnJia3ZnY2lpbXNzcnhmdWt0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5NTg2NjEsImV4cCI6MjA5MzUzNDY2MX0.j9HnvxHLPBL1JeG6l0Xw-Qsq5IriACXQtG34T83OwVc"
       }
     }
   }

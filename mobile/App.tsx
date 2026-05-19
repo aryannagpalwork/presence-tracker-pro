@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -20,12 +20,19 @@ import {
   SEND_INTERVAL_MS,
   setSharingEnabled,
   sendLocationIfNeeded,
+  restoreTrackingState,
+  resumeTrackingSession,
   startTrackingSession,
   startBackgroundLocation,
   stopBackgroundLocation,
   type LocationPoint,
 } from "./src/locationSender";
 import { supabase } from "./src/supabase";
+
+const FRESH_LOCATION_OPTIONS = {
+  accuracy: Location.Accuracy.High,
+  maximumAge: 0,
+} as Location.LocationOptions & { maximumAge: 0 };
 
 function locationErrorMessage(error: unknown) {
   if (error instanceof Error) return error.message;
@@ -34,6 +41,7 @@ function locationErrorMessage(error: unknown) {
 
 export default function App() {
   const watchRef = useRef<Location.LocationSubscription | null>(null);
+  const foregroundPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [session, setSession] = useState<Session | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authMode, setAuthMode] = useState<"signin" | "signup">("signin");
@@ -65,8 +73,113 @@ export default function App() {
   useEffect(() => {
     return () => {
       watchRef.current?.remove();
+      if (foregroundPollRef.current) clearInterval(foregroundPollRef.current);
     };
   }, []);
+
+  const sendFreshLocation = useCallback(async (options: { force?: boolean } = {}) => {
+    const location = await Location.getCurrentPositionAsync(FRESH_LOCATION_OPTIONS);
+    console.log("GPS location fetched:", {
+      latitude: location.coords.latitude,
+      longitude: location.coords.longitude,
+      accuracy: location.coords.accuracy,
+      timestamp: location.timestamp,
+    });
+    const result = await sendLocationIfNeeded(location, options);
+
+    if (result.sent) {
+      setLastPoint(result.point);
+      setUpdatesSent((count) => count + 1);
+    }
+
+    setStatus(result.sent ? "LIVE" : result.message);
+    if (!result.sent && result.error) Alert.alert("Location send failed", result.error);
+
+    return { location, result };
+  }, []);
+
+  const startForegroundTracking = useCallback(async () => {
+    watchRef.current?.remove();
+    if (foregroundPollRef.current) clearInterval(foregroundPollRef.current);
+
+    watchRef.current = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.BestForNavigation,
+        timeInterval: SEND_INTERVAL_MS,
+        distanceInterval: 0,
+      },
+      async (location) => {
+        console.log("GPS location fetched:", {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          accuracy: location.coords.accuracy,
+          timestamp: location.timestamp,
+        });
+        const point = {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          accuracy: Number.isFinite(location.coords.accuracy ?? NaN)
+            ? location.coords.accuracy
+            : null,
+          createdAt: Date.now(),
+          networkType: null,
+          isConnected: null,
+          isInternetReachable: null,
+        };
+        setLastPoint(point);
+
+        const result = await sendLocationIfNeeded(location);
+        setStatus(result.sent ? "LIVE" : result.message);
+        if (result.sent) setUpdatesSent((count) => count + 1);
+        if (!result.sent && result.error) Alert.alert("Location send failed", result.error);
+      },
+    );
+
+    foregroundPollRef.current = setInterval(() => {
+      void sendFreshLocation();
+    }, SEND_INTERVAL_MS);
+  }, [sendFreshLocation]);
+
+  useEffect(() => {
+    if (!session) return;
+
+    let cancelled = false;
+    restoreTrackingState().then(async ({ sharingEnabled, sessionId: storedSessionId }) => {
+      if (cancelled) return;
+      setSessionId(storedSessionId);
+
+      if (!sharingEnabled || !storedSessionId) return;
+
+      setSharing(true);
+      setStatus("Restoring live tracking");
+      try {
+        const location = await Location.getCurrentPositionAsync(FRESH_LOCATION_OPTIONS);
+        console.log("GPS location fetched:", {
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          accuracy: location.coords.accuracy,
+        });
+        const restored = await resumeTrackingSession(location);
+        if (!restored.sessionId) {
+          setStatus("Session restore failed");
+          Alert.alert("Tracking restore failed", restored.error ?? "Could not restore session.");
+          return;
+        }
+
+        setSessionId(restored.sessionId);
+        await sendFreshLocation({ force: true });
+        await startForegroundTracking();
+        setStatus("LIVE");
+      } catch (error) {
+        setStatus("Restore failed");
+        Alert.alert("Tracking restore failed", locationErrorMessage(error));
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sendFreshLocation, session, startForegroundTracking]);
 
   async function signIn() {
     setBusy(true);
@@ -148,8 +261,12 @@ export default function App() {
       }
 
       await setSharingEnabled(true);
-      const initialLocation = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.High,
+      const initialLocation = await Location.getCurrentPositionAsync(FRESH_LOCATION_OPTIONS);
+      console.log("GPS location fetched:", {
+        latitude: initialLocation.coords.latitude,
+        longitude: initialLocation.coords.longitude,
+        accuracy: initialLocation.coords.accuracy,
+        timestamp: initialLocation.timestamp,
       });
       const session = await startTrackingSession(initialLocation);
       if (!session.sessionId) {
@@ -160,40 +277,10 @@ export default function App() {
       }
       setSessionId(session.sessionId);
 
-      const initialResult = await sendLocationIfNeeded(initialLocation, { force: true });
-      if (initialResult.sent) {
-        setLastPoint(initialResult.point);
-        setUpdatesSent((count) => count + 1);
-      }
+      await sendFreshLocation({ force: true });
 
       if (backgroundGranted) await startBackgroundLocation();
-
-      watchRef.current = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.High,
-          timeInterval: SEND_INTERVAL_MS,
-          distanceInterval: 0,
-        },
-        async (location) => {
-          const point = {
-            latitude: location.coords.latitude,
-            longitude: location.coords.longitude,
-            accuracy: Number.isFinite(location.coords.accuracy ?? NaN)
-              ? location.coords.accuracy
-              : null,
-            createdAt: Date.now(),
-            networkType: null,
-            isConnected: null,
-            isInternetReachable: null,
-          };
-          setLastPoint(point);
-
-          const result = await sendLocationIfNeeded(location);
-          setStatus(result.sent ? "LIVE" : result.message);
-          if (result.sent) setUpdatesSent((count) => count + 1);
-          if (!result.sent && result.error) Alert.alert("Location send failed", result.error);
-        },
-      );
+      await startForegroundTracking();
 
       setSharing(true);
       setStatus("LIVE");
@@ -208,9 +295,7 @@ export default function App() {
   async function stopSharing() {
     let finalLocation: Location.LocationObject | undefined;
     try {
-      finalLocation = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.High,
-      });
+      finalLocation = await Location.getCurrentPositionAsync(FRESH_LOCATION_OPTIONS);
       await sendLocationIfNeeded(finalLocation, { force: true });
     } catch {
       finalLocation = undefined;
@@ -218,6 +303,10 @@ export default function App() {
 
     watchRef.current?.remove();
     watchRef.current = null;
+    if (foregroundPollRef.current) {
+      clearInterval(foregroundPollRef.current);
+      foregroundPollRef.current = null;
+    }
     await setSharingEnabled(false);
     await stopBackgroundLocation();
     await endTrackingSession(finalLocation);
